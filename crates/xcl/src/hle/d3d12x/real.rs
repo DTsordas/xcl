@@ -3531,6 +3531,12 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// for one of the `XCL_HUGE_PSO_CONCURRENCY` slots. NVIDIA's compiler (nvgpucomp64) takes
 /// minutes and ~1 GB for a 1 – 2 MB program; ~20 of them at once (one per worker) were slower
 /// in total than 1 – 2 at a time. Small programs (ms each) never wait.
+/// `XCL_PSO_REFUSE_BYTES`: compute programs with this much DXIL or more are never built (off by default).
+fn refuse_pso_bytes() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_PSO_REFUSE_BYTES").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0))
+}
+
 fn huge_pso_bytes() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_BYTES").ok().as_deref(), 256 << 10, 1, usize::MAX))
@@ -3829,6 +3835,13 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     // whose DXIL is missing – the title's loading does not wait for it, its first bind does
     let big = dxil.len() >= huge_pso_bytes();
     if big && crate::gpu::recomp::dxc::defer() {
+        return Some(Err(()));
+    }
+    // `XCL_PSO_REFUSE_BYTES=N`: a program of N bytes of DXIL or more is not given to the driver at all
+    // (the AMD driver needs > 55 GB for the 3-4 MB ScreenProbes `Activate*` programs; #1269): its
+    // dispatches keep the stand-in, the rest of the title goes on
+    if refuse_pso_bytes().is_some_and(|n| dxil.len() >= n) {
+        crate::xlog_warn!("compute PSO with {} B of DXIL refused (XCL_PSO_REFUSE_BYTES)", dxil.len());
         return Some(Err(()));
     }
     let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
