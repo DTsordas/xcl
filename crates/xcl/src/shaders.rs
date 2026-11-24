@@ -942,13 +942,20 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         recomp::dxc::compile_threads(),
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
+    // programs whose source another worker was compiling: done after the rest (`set_skip_busy`)
+    let later: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    let deferred = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= n {
-                    break;
-                }
+                let (i, retry) = match next.fetch_add(1, Ordering::Relaxed) {
+                    i if i < n => (i, false),
+                    _ => match later.lock().unwrap().pop() {
+                        Some(i) => (i, true),
+                        None => break,
+                    },
+                };
+                recomp::dxc::set_skip_busy(!retry);
                 let (name, blob) = input.get(i);
                 let every = PRECOMPILE_EVERY.load(Ordering::Relaxed).max(1) as u64;
                 if name_hash(&name) % every != 0 {
@@ -975,6 +982,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
+                        Err(_) if recomp::dxc::take_busy() => {
+                            precompile_log(&name, "cs", t, 0, "busy");
+                            later.lock().unwrap().push(i);
+                            deferred.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         Err(e) => {
                             precompile_log(&name, "cs", t, 0, "error");
                             let mut g = errors.lock().unwrap();
@@ -990,7 +1003,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     }
                     continue;
                 }
+                let mut busy = false;
                 for f in &sh.fssm {
+                    if busy {
+                        break;
+                    }
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
                         recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
@@ -1003,6 +1020,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         }
                     };
                     for p in &f.programs {
+                        if busy {
+                            break;
+                        }
                         let code = &f.data[p.offset..p.offset + p.len];
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
@@ -1016,6 +1036,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             let hlsl = src.as_deref().unwrap_or(&t.hlsl);
                             let at = std::time::Instant::now();
                             let r = recomp::dxc::compile_cached(hlsl, "main", profile);
+                            if r.is_err() && recomp::dxc::take_busy() {
+                                precompile_log(&name, profile, at, hlsl.len(), "busy");
+                                busy = true;
+                                break;
+                            }
                             let outcome = match &r {
                                 Ok((_, true)) => "cached",
                                 Ok(_) => "ok",
@@ -1023,6 +1048,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             };
                             precompile_log(&name, profile, at, hlsl.len(), outcome);
                             match r {
+                                // a retried program finds what it compiled before in the cache
+                                Ok((_, true)) if retry => 0,
                                 Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
                                 Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
                                 Err(e) => {
@@ -1035,6 +1062,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             };
                         }
                     }
+                }
+                if busy {
+                    later.lock().unwrap().push(i);
+                    deferred.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if d % 200 == 0 {
@@ -1051,6 +1083,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    println!("set aside while another worker compiled the same source, then done: {}", deferred.into_inner());
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));

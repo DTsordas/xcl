@@ -799,7 +799,16 @@ where
     }
     counters.misses.fetch_add(1, Ordering::Relaxed);
     let flight = cache_flight((dir.clone(), key));
-    let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = match flight.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        // inside `skip_busy`: another thread compiles this source, come back later
+        Err(std::sync::TryLockError::WouldBlock) if SKIP_BUSY.with(|c| c.get()) => {
+            BUSY.with(|b| b.set(true));
+            return Err(BUSY_ERROR.into());
+        }
+        Err(std::sync::TryLockError::WouldBlock) => flight.lock().unwrap_or_else(|e| e.into_inner()),
+    };
     let _process_guard = process_cache_lock(&file)?;
     // Another caller may have populated the cache while this one waited.
     if let Some(b) = cached_file(&file) {
@@ -869,6 +878,25 @@ pub fn compile_counts() -> (usize, usize) {
 thread_local! {
     static CACHED_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static MISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SKIP_BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The error of a compile `skip_busy` gave up on.
+pub const BUSY_ERROR: &str = "DXC: the same source is being compiled by another thread";
+
+/// On this thread from now on: a compile whose source another thread is compiling right now
+/// fails at once (`BUSY_ERROR`) instead of waiting for it. `xcl shaders --precompile` comes back
+/// to that program later, when the DXIL is in the cache: retail packs hold many copies of one
+/// program (material variants), and copies of a 20-minute compile otherwise held every worker
+/// while one core compiled.
+pub fn set_skip_busy(on: bool) {
+    SKIP_BUSY.with(|c| c.set(on));
+}
+
+/// Whether a compile was given up (`set_skip_busy`) on this thread since the last call.
+pub fn take_busy() -> bool {
+    BUSY.with(|b| b.replace(false))
 }
 
 /// Run `f` without compiling: a program missing from the disk cache fails at once instead
@@ -1093,6 +1121,46 @@ mod cache_tests {
         let (_, hit) = compile_cached_in_with(&dir, "fresh validation", "main", "cs_6_6", || panic!("valid retry was not cached")).unwrap();
         assert!(hit);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skip_busy_gives_up_on_a_source_another_thread_compiles() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let d = &dir;
+        std::thread::scope(|s| {
+            let worker = s.spawn(move || {
+                compile_cached_in_with(d, "giant", "main", "cs_6_6", || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(synthetic_dxil(6))
+                })
+            });
+            entered_rx.recv().unwrap();
+            // the same source while the worker holds its compile: given up at once, no compile
+            set_skip_busy(true);
+            let r = compile_cached_in_with(&dir, "giant", "main", "cs_6_6", || panic!("compiled a busy source twice"));
+            set_skip_busy(false);
+            assert_eq!(r.unwrap_err(), BUSY_ERROR);
+            assert!(take_busy());
+            assert!(!take_busy(), "take_busy clears the flag");
+            // another source is not affected
+            set_skip_busy(true);
+            let (_, hit) = compile_cached_in_with(&dir, "small", "main", "cs_6_6", || Ok(synthetic_dxil(7))).unwrap();
+            set_skip_busy(false);
+            assert!(!hit && !take_busy());
+            release_tx.send(()).unwrap();
+            assert!(!worker.join().unwrap().unwrap().1);
+        });
+        // coming back later: the worker's DXIL is in the cache
+        set_skip_busy(true);
+        let (dxil, hit) = compile_cached_in_with(&dir, "giant", "main", "cs_6_6", || panic!("not cached")).unwrap();
+        set_skip_busy(false);
+        assert!(hit);
+        assert_eq!(dxil, synthetic_dxil(6));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
