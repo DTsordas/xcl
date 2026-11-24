@@ -1224,7 +1224,8 @@ impl Pipelines {
     }
 
     /// The compute pipeline of `c` (made and released).
-    fn make(&self, c: &recomp::pso::Compiled) {
+    /// Returns when the build got its slot (`XCL_PIPELINE_THREADS`) and its outcome.
+    fn make(&self, c: &recomp::pso::Compiled) -> (std::time::Instant, &'static str) {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
@@ -1238,7 +1239,7 @@ impl Pipelines {
                     }
                     Err(_) => {
                         self.refused.fetch_add(1, Ordering::Relaxed);
-                        return;
+                        return (std::time::Instant::now(), "no root signature");
                     }
                 },
             }
@@ -1255,6 +1256,7 @@ impl Pipelines {
             }
             *n += 1;
         }
+        let started = std::time::Instant::now();
         use crate::hle::d3d12x::real::driver_cache;
         let path = driver_cache::path(&c.dxil, desc.Flags.0);
         let cached = path.as_deref().and_then(driver_cache::load);
@@ -1262,6 +1264,7 @@ impl Pipelines {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.ok()
         });
+        let reused = from_cache.is_some();
         let r = if let Some(pso) = from_cache {
             self.reused.fetch_add(1, Ordering::Relaxed);
             Ok(pso)
@@ -1282,6 +1285,11 @@ impl Pipelines {
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        let outcome = match (&r, reused) {
+            (Err(_), _) => "refused",
+            (Ok(_), true) => "cached",
+            (Ok(_), false) => "ok",
+        };
         let done = match r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
@@ -1289,6 +1297,7 @@ impl Pipelines {
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
+        (started, outcome)
     }
 }
 
@@ -1359,12 +1368,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         Ok(c) => {
                             precompile_log(&name, "cs", t, c.dxil.len(), "ok");
                             if let Some(p) = pipelines {
-                                let t = std::time::Instant::now();
-                                p.make(&c);
+                                // timed from when the build gets its slot, not from the wait for one
+                                let (t, outcome) = p.make(&c);
                                 // the process's commit after the build: with `XCL_PIPELINE_THREADS=1`, what the
                                 // driver's compiler holds shows up here
                                 let gb = crate::hle::kernelx::process_private_bytes() as f64 / (1u64 << 30) as f64;
-                                precompile_log(&name, "driver", t, c.dxil.len(), &format!("ok	{gb:.1} GB"));
+                                precompile_log(&name, "driver", t, c.dxil.len(), &format!("{outcome}	{gb:.1} GB"));
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
