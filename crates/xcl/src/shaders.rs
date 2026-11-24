@@ -286,6 +286,20 @@ static EXAMPLE_FOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// (a fixed sample of the pack, for timing DXC and driver compiles of two builds)
 static PRECOMPILE_EVERY: AtomicUsize = AtomicUsize::new(1);
 
+/// `xcl shaders --precompile --log <file>`: one tab-separated line per compile, for finding the
+/// programs that cost the most: name, step (`cs` = translation + DXC of a compute program,
+/// `driver` = its pipeline on the GPU, else the DXC profile), milliseconds, bytes (DXIL for
+/// `cs` / `driver`, HLSL for the others), `cached` / `ok` / `error`
+static PRECOMPILE_LOG: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
+
+fn precompile_log(name: &str, step: &str, t: std::time::Instant, bytes: usize, outcome: &str) {
+    if let Some(f) = PRECOMPILE_LOG.get() {
+        use std::io::Write;
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let _ = writeln!(f.lock().unwrap(), "{name}	{step}	{ms:.0}	{bytes}	{outcome}");
+    }
+}
+
 /// `xcl shaders --recomp --size-by-op`
 static SIZE_BY_OP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -767,6 +781,17 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
         PRECOMPILE_EVERY.store(opt("--every").unwrap_or(1), Ordering::Relaxed);
+        if let Some(path) = args.iter().position(|a| a == "--log").and_then(|i| args.get(i + 1)) {
+            match std::fs::File::create(path) {
+                Ok(f) => {
+                    let _ = PRECOMPILE_LOG.set(Mutex::new(f));
+                }
+                Err(e) => {
+                    eprintln!("xcl shaders --log {path}: {e}");
+                    return 2;
+                }
+            }
+        }
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
@@ -939,14 +964,19 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                    let t = std::time::Instant::now();
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
+                            precompile_log(&name, "cs", t, c.dxil.len(), "ok");
                             if let Some(p) = pipelines {
+                                let t = std::time::Instant::now();
                                 p.make(&c);
+                                precompile_log(&name, "driver", t, c.dxil.len(), "ok");
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
                         Err(e) => {
+                            precompile_log(&name, "cs", t, 0, "error");
                             let mut g = errors.lock().unwrap();
                             if g.len() < 10 {
                                 g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
@@ -983,7 +1013,16 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             continue;
                         }
                         for (profile, src) in &jobs {
-                            match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
+                            let hlsl = src.as_deref().unwrap_or(&t.hlsl);
+                            let at = std::time::Instant::now();
+                            let r = recomp::dxc::compile_cached(hlsl, "main", profile);
+                            let outcome = match &r {
+                                Ok((_, true)) => "cached",
+                                Ok(_) => "ok",
+                                Err(_) => "error",
+                            };
+                            precompile_log(&name, profile, at, hlsl.len(), outcome);
+                            match r {
                                 Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
                                 Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
                                 Err(e) => {
