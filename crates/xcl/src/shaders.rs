@@ -283,6 +283,10 @@ static HEADER_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// `xcl shaders --example MNEMONIC`
 static EXAMPLE_FOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// `xcl shaders --precompile --every K`: only the programs whose name hash is a multiple of K
+/// (a fixed sample of the pack, for timing DXC and driver compiles of two builds)
+static PRECOMPILE_EVERY: AtomicUsize = AtomicUsize::new(1);
+
 /// `xcl shaders --recomp --size-by-op`
 static SIZE_BY_OP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -943,6 +947,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let pipelines = args.iter().any(|a| a == "--pipelines");
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
+        PRECOMPILE_EVERY.store(opt("--every").unwrap_or(1), Ordering::Relaxed);
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
     if args.iter().any(|a| a == "--direct") {
@@ -1302,6 +1307,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     break;
                 }
                 let (name, blob) = input.get(i);
+                let every = PRECOMPILE_EVERY.load(Ordering::Relaxed).max(1) as u64;
+                if name_hash(&name) % every != 0 {
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let Some(blob) = blob else { continue };
                 let Some(sh) = xbox::parse(&blob) else { continue };
                 if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
