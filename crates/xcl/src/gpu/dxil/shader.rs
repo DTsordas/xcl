@@ -486,8 +486,13 @@ impl Shader {
         }
         self.m.optimize();
         self.infer_type_features();
-        let flags: u64 = self.features.iter().map(|f| f.metadata_bit()).fold(0, |a, b| a | b);
+        let mut flags: u64 = self.features.iter().map(|f| f.metadata_bit()).fold(0, |a, b| a | b);
         let sfi0: u64 = self.features.iter().map(|f| f.container_bit()).fold(0, |a, b| a | b);
+        // `XCL_DXIL_NO_OPT=1`: the `DisableOptimizations` shader flag (what DXC's `-Od` sets), a hint to the
+        // driver's compiler to skip its optimization passes (experiment for the AMD driver on giant programs)
+        if no_opt() {
+            flags |= 1;
+        }
 
         let m = &mut self.m;
         let one = m.md_i32(1);
@@ -584,4 +589,10 @@ pub fn dxc_fn_attrs(op: u32) -> Option<FnAttrs> {
         221 => ReadOnly,                       // isHelperLane
         _ => return Option::None,
     })
+}
+
+/// `XCL_DXIL_NO_OPT=1`: compute programs carry the `DisableOptimizations` shader flag.
+fn no_opt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DXIL_NO_OPT").is_ok_and(|v| v.trim() == "1"))
 }
