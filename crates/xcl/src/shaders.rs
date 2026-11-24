@@ -290,7 +290,8 @@ static PRECOMPILE_EVERY: AtomicUsize = AtomicUsize::new(1);
 /// `xcl shaders --precompile --log <file>`: one tab-separated line per compile, for finding the
 /// programs that cost the most: name, step (`cs` = translation + DXC of a compute program,
 /// `driver` = its pipeline on the GPU, else the DXC profile), milliseconds, bytes (DXIL for
-/// `cs` / `driver`, HLSL for the others), `cached` / `ok` / `error`
+/// `cs` / `driver`, HLSL for the others), `cached` / `ok` / `error`; `driver` lines add the
+/// process's private commit after the build
 static PRECOMPILE_LOG: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
 
 fn precompile_log(name: &str, step: &str, t: std::time::Instant, bytes: usize, outcome: &str) {
@@ -1360,7 +1361,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             if let Some(p) = pipelines {
                                 let t = std::time::Instant::now();
                                 p.make(&c);
-                                precompile_log(&name, "driver", t, c.dxil.len(), "ok");
+                                // the process's commit after the build: with `XCL_PIPELINE_THREADS=1`, what the
+                                // driver's compiler holds shows up here
+                                let gb = crate::hle::kernelx::process_private_bytes() as f64 / (1u64 << 30) as f64;
+                                precompile_log(&name, "driver", t, c.dxil.len(), &format!("ok	{gb:.1} GB"));
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
