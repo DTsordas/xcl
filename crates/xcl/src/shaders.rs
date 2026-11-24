@@ -286,6 +286,8 @@ static EXAMPLE_FOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// `xcl shaders --precompile --every K`: only the programs whose name hash is a multiple of K
 /// (a fixed sample of the pack, for timing DXC and driver compiles of two builds)
 static PRECOMPILE_EVERY: AtomicUsize = AtomicUsize::new(1);
+// `--precompile --skip a,b`: programs whose name contains one of these are left out
+static PRECOMPILE_SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 /// `xcl shaders --precompile --log <file>`: one tab-separated line per compile, for finding the
 /// programs that cost the most: name, step (`cs` = translation + DXC of a compute program,
@@ -963,6 +965,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
         PRECOMPILE_EVERY.store(opt("--every").unwrap_or(1), Ordering::Relaxed);
+        if let Some(list) = args.iter().position(|a| a == "--skip").and_then(|i| args.get(i + 1)) {
+            let _ = PRECOMPILE_SKIP.set(list.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect());
+        }
         if let Some(path) = args.iter().position(|a| a == "--log").and_then(|i| args.get(i + 1)) {
             match std::fs::File::create(path) {
                 Ok(f) => {
@@ -1350,7 +1355,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 recomp::dxc::set_skip_busy(!retry);
                 let (name, blob) = input.get(i);
                 let every = PRECOMPILE_EVERY.load(Ordering::Relaxed).max(1) as u64;
-                if name_hash(&name) % every != 0 {
+                if name_hash(&name) % every != 0 || PRECOMPILE_SKIP.get().is_some_and(|k| k.iter().any(|k| name.contains(k.as_str()))) {
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
