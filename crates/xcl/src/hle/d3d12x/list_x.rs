@@ -3060,6 +3060,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_after(q_raw, prior, &write64_signals, |chunk| {
+                // (#2160's resubmit check: the KickoffX path submits split segments too)
+                let _ = super::alloc_pool::note_resubmits(q_raw, chunk);
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
                 copy_scratch_submitted(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
@@ -3079,6 +3081,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
+    let _ = super::alloc_pool::note_resubmits(q_raw, &one);
     exec(q_raw, 1, one.as_ptr());
     copy_scratch_submitted(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
