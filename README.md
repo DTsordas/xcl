@@ -253,6 +253,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `XCL_PSO_TRACE=1` logs every driver compile. A huge compute program the driver refuses is
   logged with the driver's verdict (`the driver refused the compute PSO of record HASH … with
   0x…`): its dispatches are skipped.
+- A compute program in the compact form (`XCL_COMPACT_CS`) with 512 cases (distinct block texts)
+  or more switches over them in two levels, in groups of 32. The driver builds the biggest ones
+  much faster that way (measured on NVIDIA and AMD); on RADV some ~700-case ones build slower.
+  `XCL_COMPACT_NEST=0` keeps one level, and a power of two up to 65536 sets the group size for
+  every compact program.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.
