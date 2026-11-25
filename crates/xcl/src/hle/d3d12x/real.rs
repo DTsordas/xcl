@@ -7233,6 +7233,23 @@ pub fn log_device_removed() {
             let va = pf.PageFaultVA;
             let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
             crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            // which console address a shader would have used to reach `va` through each window:
+            // a console address outside the windows (title-private memory) turned into a window
+            // offset lands outside every window (#1269)
+            if let Some(u) = crate::gpu::uma::get() {
+                let vas = uma_window_vas();
+                for k in 0..vas.len() {
+                    let (base, size) = u.window(k);
+                    let cva = (base as u64).wrapping_add(va.wrapping_sub(vas[k]));
+                    crate::xlog_error!(
+                        "DRED: window {k}: console {base:#x}..{:#x}, PC VA {:#x}; the fault through it = console {cva:#x} (title address: {}, readable: {})",
+                        base + size,
+                        vas[k],
+                        u.is_title_address(cva as usize),
+                        crate::gpu::shader::readable(cva as usize, 4)
+                    );
+                }
+            }
         }
         if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
             report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
