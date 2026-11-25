@@ -1792,6 +1792,17 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
             }
             None => return GpuWaitOutcome::FallbackCpu,
         };
+        // `XCL_GPU_WAIT_NEEDS_PRODUCER=1`: a wait whose value no queue has submitted yet and whose
+        // producer queue is unknown is not armed on the GPU (a queue.Wait nothing may ever signal
+        // blocks that queue for good): the CPU wait, with its timeout, takes it instead. On AMD the
+        // world-start DXGI_ERROR_DEVICE_HUNG came 0.7 s after such a wait (#1269).
+        if pre_ok.0 && pre_ok.2.is_none() && needs_producer() {
+            static LOGGED: AtomicU64 = AtomicU64::new(0);
+            if once(&LOGGED, 8) {
+                crate::xlog_info!("D3D12.X: Wait64BitValueX at {:#x} >= {:#x}: no producer queue yet – CPU wait instead of GPU queue.Wait", w.va, w.value);
+            }
+            return GpuWaitOutcome::FallbackCpu;
+        }
         let wait_seq = graph.next_seq(q_raw);
         let cell = graph.cells.get_mut(&w.va).unwrap();
         cell.armed_waits.push(ArmedGpuWait {
@@ -6221,4 +6232,10 @@ mod tests {
             // address must not come back for another test's memory
         }
     }
+}
+
+/// `XCL_GPU_WAIT_NEEDS_PRODUCER=1` (see `try_gpu_wait`).
+fn needs_producer() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_GPU_WAIT_NEEDS_PRODUCER").is_ok_and(|v| v.trim() == "1"))
 }
