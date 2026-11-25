@@ -1227,6 +1227,12 @@ impl Pipelines {
 
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
+        // `XCL_PSO_REFUSE_BYTES`: the title never builds these, so neither does the precompile
+        if crate::hle::d3d12x::real::refuse_pso_bytes().is_some_and(|n| c.dxil.len() >= n) {
+            eprintln!("  compute pipeline with {} B of DXIL left out (XCL_PSO_REFUSE_BYTES)", c.dxil.len());
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
             let mut g = self.signatures.lock().unwrap();

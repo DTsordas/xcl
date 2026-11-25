@@ -3939,7 +3939,7 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// minutes and ~1 GB for a 1 – 2 MB program; ~20 of them at once (one per worker) were slower
 /// in total than 1 – 2 at a time. Small programs (ms each) never wait.
 /// `XCL_PSO_REFUSE_BYTES`: compute programs with this much DXIL or more are never built (off by default).
-fn refuse_pso_bytes() -> Option<usize> {
+pub fn refuse_pso_bytes() -> Option<usize> {
     static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("XCL_PSO_REFUSE_BYTES").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0))
 }
