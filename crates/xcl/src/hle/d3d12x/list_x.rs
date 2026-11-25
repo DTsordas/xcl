@@ -1931,7 +1931,17 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
 /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
 /// When `queue` is non-null, monotonic 64-bit waits backed by a recorded `Write64BitValue*` are
 /// bridged to GPU-side `queue.Wait` without blocking the submitter thread on the CPU.
-pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
+pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], submit: impl FnMut(&[*mut c_void])) {
+    execute_with_waits_after(queue, lists, &[], submit)
+}
+
+/// `execute_with_waits_on`; `after`: `Write64` signals of what this submission is followed by
+/// (the last segment of a split list). A list's waits are checked for a same-batch self-wait
+/// against the writes of that list AND of every list after it in the batch: after a mid-list
+/// split the producer of a segment's wait can sit in a LATER segment of the same recording, and a
+/// `queue.Wait` hoisted ahead of it deadlocks the queue (on AMD a GPU-wide
+/// DXGI_ERROR_DEVICE_HUNG at world start, #1269).
+pub(super) unsafe fn execute_with_waits_after(queue: *mut c_void, lists: &[*mut c_void], after: &[(u64, u64)], mut submit: impl FnMut(&[*mut c_void])) {
     if lists.is_empty() || PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
         submit(lists);
         return;
@@ -1956,7 +1966,12 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
         if i > start {
             submit(&lists[start..i]);
         }
-        wait_all_on(queue, waits, list_writes);
+        let mut batch_writes: Vec<(u64, u64)> = list_writes.clone();
+        for (_, later) in &per_list[i + 1..] {
+            batch_writes.extend_from_slice(later);
+        }
+        batch_writes.extend_from_slice(after);
+        wait_all_on(queue, waits, &batch_writes);
         start = i;
     }
     if start < lists.len() {
@@ -2973,7 +2988,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
-            execute_with_waits_on(q_raw, prior, |chunk| {
+            execute_with_waits_after(q_raw, prior, &write64_signals, |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
                 copy_scratch_submitted(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
