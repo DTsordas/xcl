@@ -1160,6 +1160,49 @@ mod pipeline_cap_tests {
     }
 
     #[test]
+    fn a_dispatch_chain_is_precompiled_as_the_runtime_builds_it() {
+        use super::{Pipelines, recomp, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-chain-pso-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        // three programs with no bindings: valid under any root signature
+        let cs = |n: u32| recomp::dxc::compile(&format!("[numthreads({n},1,1)] void main() {{}}"), "main", "cs_6_6", &[]).expect("DXC compile");
+        let (whole, a, b) = (cs(1), cs(2), cs(4));
+        let plan = crate::gpu::dxil::kernel::DispatchChain { pieces: vec![a.clone(), b.clone()], dwords_per_group: 0 };
+        let c = recomp::pso::Compiled { dispatch_chain: Some(std::sync::Arc::new(plan)), dxil: whole.clone(), samplers: vec![] };
+        let dir = scratch.0.clone();
+        let path_of = move |dxil: &[u8]| {
+            let name = std::path::Path::new(&crate::hle::d3d12x::real::driver_cache::name(dxil, 0)).with_extension("chain.pso");
+            Some(dir.join(name))
+        };
+        assert!(pipelines.make_chain(&c, &path_of));
+        assert_eq!((pipelines.made.load(Ordering::Relaxed), pipelines.refused.load(Ordering::Relaxed)), (3, 0));
+        for dxil in [&a, &b, &whole] {
+            let p = path_of(dxil).unwrap();
+            assert!(p.exists(), "{} missing", p.display());
+        }
+        // a program without a chain plan is not one
+        assert!(!pipelines.make_chain(&recomp::pso::Compiled { dispatch_chain: None, dxil: whole, samplers: vec![] }, &path_of));
+    }
+
+    #[test]
     fn stale_blob_cannot_bypass_the_offline_pipeline_cap() {
         use super::{Pipelines, recomp, Ordering};
         use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1226,11 +1269,17 @@ impl Pipelines {
     }
 
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
-        use windows::Win32::Graphics::Direct3D12::*;
         // `XCL_PSO_REFUSE_BYTES`: the title never builds these, so neither does the precompile
         if crate::hle::d3d12x::real::refuse_pso_bytes().is_some_and(|n| c.dxil.len() >= n) {
             eprintln!("  compute pipeline with {} B of DXIL left out (XCL_PSO_REFUSE_BYTES)", c.dxil.len());
             self.refused.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        use crate::hle::d3d12x::real::driver_cache;
+        // a program the runtime runs as a dispatch chain: it builds the pieces and, when a
+        // dispatch needs it, the whole program, all with the chain's root signature and their
+        // driver blobs kept as `.chain.pso` – the same here, or the title builds them itself
+        if path_override.is_none() && self.make_chain(c, chain_blob_path) {
             return;
         }
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
@@ -1250,21 +1299,43 @@ impl Pipelines {
                 },
             }
         };
+        self.build(&c.dxil, rs, path_override.or_else(|| driver_cache::path(&c.dxil, 0)));
+    }
+
+    /// The pipelines of `c`'s dispatch chain (each piece and the whole program, under the chain's
+    /// root signature), their blobs kept at `path_of(dxil)`; false: `c` is not run as a chain.
+    fn make_chain(&self, c: &recomp::pso::Compiled, path_of: impl Fn(&[u8]) -> Option<PathBuf>) -> bool {
+        let Some(plan) = c.dispatch_chain.as_ref().filter(|p| p.pieces.len() >= 2) else { return false };
+        match recomp::pso::dispatch_chain_root_signature(&self.dev, &c.samplers) {
+            Ok(rs) => {
+                for dxil in plan.pieces.iter().map(Vec::as_slice).chain([c.dxil.as_slice()]) {
+                    self.build(dxil, rs.clone(), path_of(dxil));
+                }
+            }
+            Err(_) => {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        true
+    }
+
+    /// One compute pipeline of `dxil` under `rs`, its driver blob kept at `path` (made and released).
+    fn build(&self, dxil: &[u8], rs: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature, path: Option<PathBuf>) {
+        use crate::hle::d3d12x::real::driver_cache;
+        use windows::Win32::Graphics::Direct3D12::*;
         let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
             ..Default::default()
         };
-        use crate::hle::d3d12x::real::driver_cache;
-        let path = path_override.or_else(|| driver_cache::path(&c.dxil, desc.Flags.0));
         let cached = path.as_deref().and_then(driver_cache::load);
-        let over_cap = self.max_dxil != 0 && c.dxil.len() > self.max_dxil;
+        let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
         // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
         // when a title needs the pipeline. `XCL_PIPELINE_MAX_KB` 0 turns the cap off.
         if cached.is_none() && over_cap {
             self.capped.fetch_add(1, Ordering::Relaxed);
-            self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
+            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
@@ -1292,7 +1363,7 @@ impl Pipelines {
             *self.running.0.lock().unwrap() -= 1;
             self.running.1.notify_one();
             self.capped.fetch_add(1, Ordering::Relaxed);
-            self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
+            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
@@ -1324,6 +1395,12 @@ impl Pipelines {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
     }
+}
+
+/// Where the runtime keeps the driver blob of a dispatch-chain pipeline (piece or whole) of
+/// `dxil`: beside the plain one, as `.chain.pso` (`compute_container`, `chained`).
+fn chain_blob_path(dxil: &[u8]) -> Option<PathBuf> {
+    crate::hle::d3d12x::real::driver_cache::path(dxil, 0).map(|p| p.with_extension("chain.pso"))
 }
 
 /// A compute program a title used in an earlier run (`--used-only`): its pipeline's key, as the
