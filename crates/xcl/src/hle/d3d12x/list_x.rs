@@ -1713,6 +1713,13 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 }
             }
         };
+        if wait_trace() {
+            crate::xlog_info!(
+                "D3D12.X: signal trace q{} {va:#x} = {val:#x} -> {}",
+                queue_id(sig_q),
+                match &action { SignalAction::Skip => "skip".to_string(), SignalAction::GpuSignal => "gpu".to_string(), SignalAction::CpuCycleBreak(w) => format!("cpu cycle break ({} waiters)", w.len()) }
+            );
+        }
         match action {
             SignalAction::Skip => {}
             SignalAction::GpuSignal => {
