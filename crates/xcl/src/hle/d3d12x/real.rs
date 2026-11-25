@@ -495,7 +495,12 @@ pub fn init() -> Result<String, String> {
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
                 Ok(d) => {
-                    d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    // `XCL_DRED=pf`: page faults only (the faulting VA and the allocations around it),
+                    // without the auto-breadcrumbs that instrument every command list (on AMD a
+                    // retail title froze in its first seconds with them)
+                    if std::env::var("XCL_DRED").map_or(true, |v| v.trim() != "pf") {
+                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
                     d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                 }
                 Err(e) => {
