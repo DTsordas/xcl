@@ -1264,6 +1264,15 @@ impl Pipelines {
         let started = std::time::Instant::now();
         use crate::hle::d3d12x::real::driver_cache;
         let path = driver_cache::path(&c.dxil, desc.Flags.0);
+        // `XCL_PRECOMPILE_SKIP_CACHED=1`: a program whose driver blob is already on disk is not loaded
+        // again (on AMD a run of fast blob loads ended in DXGI_ERROR_DEVICE_HUNG after 650-1085 of them)
+        if path.as_deref().is_some_and(|p| p.exists()) && std::env::var("XCL_PRECOMPILE_SKIP_CACHED").is_ok_and(|v| v == "1") {
+            *self.running.0.lock().unwrap() -= 1;
+            self.running.1.notify_one();
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            self.reused.fetch_add(1, Ordering::Relaxed);
+            return (started, "on disk");
+        }
         let cached = path.as_deref().and_then(driver_cache::load);
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
@@ -1290,6 +1299,10 @@ impl Pipelines {
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        if let Err(e) = &r {
+            let removed = unsafe { self.dev.GetDeviceRemovedReason() };
+            eprintln!("xcl shaders: CreateComputePipelineState: {e} (device removed reason: {removed:?})");
+        }
         let outcome = match (&r, reused) {
             (Err(_), _) => "refused",
             (Ok(_), true) => "cached",
