@@ -1323,6 +1323,13 @@ impl Pipelines {
     fn build(&self, dxil: &[u8], rs: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature, path: Option<PathBuf>) {
         use crate::hle::d3d12x::real::driver_cache;
         use windows::Win32::Graphics::Direct3D12::*;
+        // `XCL_PRECOMPILE_SKIP_CACHED=1`: a pipeline whose driver blob is already on disk is not
+        // loaded again (on AMD a long run of blob loads in one process ended in
+        // DXGI_ERROR_DEVICE_HUNG after several hundred of them, and every build after it failed)
+        if path.as_deref().is_some_and(|p| p.exists()) && std::env::var("XCL_PRECOMPILE_SKIP_CACHED").is_ok_and(|v| v.trim() == "1") {
+            self.reused.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
@@ -1384,6 +1391,10 @@ impl Pipelines {
             }
             pso
         };
+        if let Err(e) = &r {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("xcl shaders: CreateComputePipelineState: {e} (device removed reason: {:?})", unsafe { self.dev.GetDeviceRemovedReason() }));
+        }
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
