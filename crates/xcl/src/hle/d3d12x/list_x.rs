@@ -1857,7 +1857,24 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
         if w.is_satisfied() {
             continue;
         }
-        match try_gpu_wait(queue, w, list_writes) {
+        let outcome = try_gpu_wait(queue, w, list_writes);
+        // `XCL_WAIT_TRACE=1`: every wait decision at submission (diagnostics for #1269's world-start hang)
+        if wait_trace() {
+            let cell = {
+                let g = SYNC_GRAPH.lock().unwrap();
+                g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.submitted_queue.map(queue_id), c.recorded_last_queue.map(queue_id)))
+            };
+            crate::xlog_info!(
+                "D3D12.X: wait trace q{} {:#x} >= {:#x} -> {} (batch writes {}, writer in batch {}, cell rec/sub/subq/recq {cell:x?})",
+                queue_id(queue as usize),
+                w.va,
+                w.value,
+                match outcome { GpuWaitOutcome::Handled => "gpu/handled", GpuWaitOutcome::CycleSkip => "skip (same batch)", GpuWaitOutcome::FallbackCpu => "cpu" },
+                list_writes.len(),
+                list_writes.iter().any(|&(va, v)| va == w.va && v >= w.value)
+            );
+        }
+        match outcome {
             GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
             GpuWaitOutcome::FallbackCpu => {}
         }
@@ -6253,4 +6270,10 @@ mod tests {
 fn needs_producer() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_GPU_WAIT_NEEDS_PRODUCER").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `XCL_WAIT_TRACE=1` (see `wait_all_on`).
+fn wait_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_WAIT_TRACE").is_ok_and(|v| v.trim() == "1"))
 }
