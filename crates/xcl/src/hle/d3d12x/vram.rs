@@ -153,6 +153,104 @@ pub fn gpu_owned(flags: u32) -> bool {
     flags & 0x7 != 0
 }
 
+/// One heap of video memory in the address map (`XCL_DRED` set): where the driver put it, so a
+/// DRED page fault can be named.
+struct MappedHeap {
+    kind: &'static str,
+    heap: usize,
+    pc_va: u64,
+    size: u64,
+    title_va: usize,
+    made: std::time::Instant,
+    /// when XCL let go of it, and how
+    gone: Option<(std::time::Instant, &'static str)>,
+}
+
+static HEAP_MAP: Mutex<Vec<MappedHeap>> = Mutex::new(Vec::new());
+
+fn heap_map_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DRED").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0"))
+}
+
+/// Puts `heap` in the address map: a 64 KiB buffer placed at its offset 0 gives its PC GPU VA.
+unsafe fn map_heap(dev: &ID3D12Device, heap: &ID3D12Heap, kind: &'static str, title_va: usize, size: u64) {
+    if !heap_map_on() {
+        return;
+    }
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: PAGE as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut p: *mut c_void = std::ptr::null_mut();
+    let hr = super::real::dev_create_placed_resource(dev.as_raw(), heap.as_raw() as usize, 0, &desc as *const _ as usize, D3D12_RESOURCE_STATE_COMMON.0 as usize, 0, &ID3D12Resource::IID as *const _ as *const windows_sys::core::GUID, &mut p);
+    if hr < 0 || p.is_null() {
+        crate::xlog_warn!("D3D12.X: heap map: no probe buffer in the {kind} for {title_va:#x} ({hr:#x})");
+        return;
+    }
+    let probe = ID3D12Resource::from_raw(p);
+    let pc_va = probe.GetGPUVirtualAddress();
+    drop(probe);
+    HEAP_MAP.lock().unwrap().push(MappedHeap { kind, heap: heap.as_raw() as usize, pc_va, size, title_va, made: std::time::Instant::now(), gone: None });
+}
+
+/// XCL let go of `heap` (`how`: swept to the retire fence, released, dropped at once).
+fn heap_gone(heap: &ID3D12Heap, how: &'static str) {
+    if !heap_map_on() {
+        return;
+    }
+    let raw = heap.as_raw() as usize;
+    let now = std::time::Instant::now();
+    if let Some(h) = HEAP_MAP.lock().unwrap().iter_mut().rev().find(|h| h.heap == raw && h.gone.is_none_or(|(_, w)| w != "released" && w != "dropped at once")) {
+        h.gone = Some((now, how));
+    }
+}
+
+/// Lines naming the heap a faulting PC GPU VA is in (live or let go, and when), else the nearest
+/// below and above it – for the DRED page-fault report.
+pub fn describe_fault_va(va: u64) -> Vec<String> {
+    if !heap_map_on() {
+        return Vec::new();
+    }
+    let now = std::time::Instant::now();
+    let g = HEAP_MAP.lock().unwrap();
+    let line = |h: &MappedHeap| {
+        let state = match h.gone {
+            None => "live".to_string(),
+            Some((t, how)) => format!("GONE ({how}) {:.3} s before this report", now.duration_since(t).as_secs_f64()),
+        };
+        format!(
+            "{} for title {:#x}: PC VA {:#x}..{:#x} ({} KiB), made {:.3} s before this report, {state}",
+            h.kind,
+            h.title_va,
+            h.pc_va,
+            h.pc_va + h.size,
+            h.size >> 10,
+            now.duration_since(h.made).as_secs_f64()
+        )
+    };
+    let hits: Vec<String> = g.iter().filter(|h| va >= h.pc_va && va < h.pc_va + h.size).map(|h| format!("in {} (+{:#x})", line(h), va - h.pc_va)).collect();
+    if !hits.is_empty() {
+        return hits;
+    }
+    let below = g.iter().filter(|h| h.pc_va + h.size <= va).max_by_key(|h| h.pc_va + h.size);
+    let above = g.iter().filter(|h| h.pc_va > va).min_by_key(|h| h.pc_va);
+    let mut out = vec![format!("in no mapped heap ({} heaps mapped)", g.len())];
+    if let Some(h) = below {
+        out.push(format!("nearest below ({:#x} under the fault): {}", va - (h.pc_va + h.size), line(h)));
+    }
+    if let Some(h) = above {
+        out.push(format!("nearest above ({:#x} over the fault): {}", h.pc_va - va, line(h)));
+    }
+    out
+}
+
 /// A new arena's heap: `size` bytes of video memory for title addresses from `va`.
 unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -> Option<ID3D12Heap> {
     let desc = D3D12_HEAP_DESC {
@@ -172,6 +270,9 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n < 16 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: video-memory arena #{n} for title addresses {va:#x}..{:#x} ({made} bytes of arenas made so far)", va + size);
+    }
+    if let Some(h) = &heap {
+        map_heap(dev, h, "arena", va, size as u64);
     }
     heap
 }
@@ -423,6 +524,9 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
         return None;
+    }
+    if let Some(h) = &heap {
+        map_heap(dev, h, "page pool", 0, POOL_PAGES as u64 * PAGE as u64);
     }
     heap
 }
@@ -1015,7 +1119,9 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                 let done_retire = pages.retire_fence.GetCompletedValue();
                 while let Some(&(_, u_val, r_val)) = pages.retiring.front() {
                     if done_unmap >= u_val && done_retire >= r_val {
-                        ready_to_drop.push(pages.retiring.pop_front().unwrap().0);
+                        let h = pages.retiring.pop_front().unwrap().0;
+                        heap_gone(&h, "released");
+                        ready_to_drop.push(h);
                     } else {
                         break;
                     }
@@ -1039,9 +1145,11 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             let rv = pages.retire_value;
             retire_signal = Some((pages.retire_fence.clone(), rv));
             for h in newly_reclaimed {
+                heap_gone(&h, "swept, waits for the retire fence");
                 pages.retiring.push_back((h, unmap_val, rv));
             }
         } else {
+            newly_reclaimed.iter().for_each(|h| heap_gone(h, "released"));
             ready_to_drop.extend(newly_reclaimed);
         }
     }
@@ -1054,6 +1162,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                 let mut kept = std::collections::VecDeque::with_capacity(pages.retiring.len());
                 for item in pages.retiring.drain(..) {
                     if item.2 == rv {
+                        heap_gone(&item.0, "released");
                         ready_to_drop.push(item.0);
                     } else {
                         kept.push_back(item);
@@ -1157,6 +1266,11 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     let align = (info.Alignment as usize).max(PAGE);
     let now = std::time::Instant::now();
+    if heap_map_on() {
+        // what `take` would sweep (and drop at once), swept here to see it go
+        let swept = ARENAS.lock().unwrap().sweep_dropped(now);
+        swept.iter().for_each(|h| heap_gone(h, "dropped at once"));
+    }
     let (heap, offset, id) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
     let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {

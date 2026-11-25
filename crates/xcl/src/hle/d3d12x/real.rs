@@ -7233,6 +7233,9 @@ pub fn log_device_removed() {
             let va = pf.PageFaultVA;
             let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
             crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            for l in super::vram::describe_fault_va(va) {
+                crate::xlog_error!("DRED: heap map: the fault is {l}");
+            }
             // which console address a shader would have used to reach `va` through each window:
             // a console address outside the windows (title-private memory) turned into a window
             // offset lands outside every window (#1269)
